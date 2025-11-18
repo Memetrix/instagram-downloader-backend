@@ -1,9 +1,90 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests
+import re
+import json
 import instaloader
+from instaloader import Post
+import os
 
 app = Flask(__name__)
 CORS(app)
+
+# Initialize Instaloader once
+L = instaloader.Instaloader(
+    download_videos=False,
+    download_video_thumbnails=False,
+    download_geotags=False,
+    download_comments=False,
+    save_metadata=False,
+    compress_json=False,
+    quiet=True
+)
+
+def extract_shortcode(url):
+    """Extract shortcode from Instagram URL"""
+    patterns = [
+        r'instagram\.com/p/([A-Za-z0-9_-]+)',
+        r'instagram\.com/reel/([A-Za-z0-9_-]+)',
+        r'instagram\.com/tv/([A-Za-z0-9_-]+)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+
+    return None
+
+def fetch_with_instaloader(shortcode):
+    """Fetch media URLs using Instaloader"""
+    try:
+        print(f"Fetching post with Instaloader: {shortcode}")
+
+        # Get post
+        post = Post.from_shortcode(L.context, shortcode)
+
+        media = []
+
+        # Check if it's a video (reel or regular video)
+        if post.is_video:
+            print(f"  Found video/reel")
+            media.append({
+                'url': post.video_url,
+                'type': 'video',
+                'thumbnail': post.url  # thumbnail image
+            })
+        else:
+            # Check if it's a sidecar (carousel/gallery)
+            if post.typename == 'GraphSidecar':
+                print(f"  Found carousel with {post.mediacount} items")
+                # Get all images from carousel
+                for node in post.get_sidecar_nodes():
+                    if node.is_video:
+                        media.append({
+                            'url': node.video_url,
+                            'type': 'video',
+                            'thumbnail': node.display_url
+                        })
+                    else:
+                        media.append({
+                            'url': node.display_url,
+                            'type': 'image'
+                        })
+            else:
+                # Single image post
+                print(f"  Found single image")
+                media.append({
+                    'url': post.url,
+                    'type': 'image'
+                })
+
+        print(f"  Successfully extracted {len(media)} media item(s)")
+        return media
+
+    except Exception as e:
+        print(f"  Instaloader error: {str(e)}")
+        return None
 
 @app.route('/api/download', methods=['POST'])
 def download():
@@ -14,56 +95,21 @@ def download():
         if not url:
             return jsonify({'error': 'No URL provided'}), 400
 
-        # Extract shortcode from URL
-        if '/p/' in url:
-            shortcode = url.split('/p/')[1].split('/')[0].split('?')[0]
-        elif '/reel/' in url:
-            shortcode = url.split('/reel/')[1].split('/')[0].split('?')[0]
-        else:
+        # Validate Instagram URL
+        shortcode = extract_shortcode(url)
+
+        if not shortcode:
             return jsonify({'error': 'Invalid Instagram URL'}), 400
 
-        # Create Instaloader instance
-        L = instaloader.Instaloader(
-            download_videos=True,
-            download_video_thumbnails=False,
-            download_geotags=False,
-            download_comments=False,
-            save_metadata=False,
-            compress_json=False,
-            post_metadata_txt_pattern='',
-            quiet=True
-        )
+        print(f"\nProcessing Instagram post: {shortcode}")
 
-        # Get post
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        # Use Instaloader to fetch media
+        media = fetch_with_instaloader(shortcode)
 
-        media = []
+        if not media:
+            return jsonify({'error': 'Failed to fetch media. Post may be private or unavailable.'}), 404
 
-        # Handle carousel/sidecar posts (multiple images/videos)
-        if post.typename == 'GraphSidecar':
-            for node in post.get_sidecar_nodes():
-                if node.is_video:
-                    media.append({
-                        'url': node.video_url,
-                        'type': 'video'
-                    })
-                else:
-                    media.append({
-                        'url': node.display_url,
-                        'type': 'image'
-                    })
-        else:
-            # Single image or video
-            if post.is_video:
-                media.append({
-                    'url': post.video_url,
-                    'type': 'video'
-                })
-            else:
-                media.append({
-                    'url': post.url,
-                    'type': 'image'
-                })
+        print(f"✅ Successfully fetched {len(media)} media item(s)\n")
 
         return jsonify({
             'success': True,
@@ -71,6 +117,7 @@ def download():
         })
 
     except Exception as e:
+        print(f"❌ Error: {str(e)}\n")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
